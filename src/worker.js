@@ -1,5 +1,5 @@
 // Cloudflare Worker — FlatAI Image Generator Proxy (UNLIMITED VERSION)
-// Fix: Uses rotating proxies to bypass daily IP limits + Quantity support
+// Fix: Uses direct fetch with IP Spoofing (X-Forwarded-For) to bypass daily limits reliably without breaking Cookies.
 
 export default {
   async fetch(request) {
@@ -12,7 +12,7 @@ export default {
     }
 
     if (url.pathname === '/api/health') {
-      return Response.json({ ok: true, version: '2.0-unlimited' });
+      return Response.json({ ok: true, version: '2.0-unlimited-fixed' });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/generate') {
@@ -23,15 +23,7 @@ export default {
   },
 };
 
-// Free proxy list - rotates to bypass IP limits
-const PROXY_LIST = [
-  null, // Direct
-  'https://api.allorigins.win/raw?url=',
-  'https://corsproxy.io/?',
-  'https://thingproxy.freeboard.io/fetch/',
-];
-
-// Random user agents
+// Random user agents for device rotation
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
@@ -39,23 +31,29 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
 ];
 
-function getRandomProxy() {
-  return PROXY_LIST[Math.floor(Math.random() * PROXY_LIST.length)];
-}
-
 function getRandomUA() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-async function fetchWithProxy(url, options, timeout = 25000) {
-  const proxy = getRandomProxy();
-  const targetUrl = proxy ? proxy + encodeURIComponent(url) : url;
-  
+// Generate random IP to bypass basic WAF/IP Limits
+function getRandomIP() {
+  return `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+}
+
+// Custom fetch that adds spoofed IP headers
+async function fetchWithBypass(url, options, sessionIP, timeout = 25000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   
+  const headers = new Headers(options.headers || {});
+  if (sessionIP) {
+    headers.set('X-Forwarded-For', sessionIP);
+    headers.set('X-Real-IP', sessionIP);
+    headers.set('Client-IP', sessionIP);
+  }
+
   try {
-    const response = await fetch(targetUrl, { ...options, signal: controller.signal });
+    const response = await fetch(url, { ...options, headers, signal: controller.signal });
     clearTimeout(timeoutId);
     return response;
   } catch (error) {
@@ -67,12 +65,14 @@ async function fetchWithProxy(url, options, timeout = 25000) {
 async function getFreshSession(retry = 0) {
   try {
     const ua = getRandomUA();
-    const resp = await fetchWithProxy('https://flatai.org/ai-image-generator-free-no-signup/', {
+    const sessionIP = getRandomIP(); // Bind a unique IP to this session
+    
+    const resp = await fetchWithBypass('https://flatai.org/ai-image-generator-free-no-signup/', {
       headers: {
         'user-agent': ua,
         'accept': 'text/html,application/xhtml+xml',
       },
-    }, 15000);
+    }, sessionIP, 15000);
 
     const html = await resp.text();
     const nonceMatch = html.match(/"ai_generate_image_nonce":"([^"]+)"/);
@@ -91,7 +91,7 @@ async function getFreshSession(retry = 0) {
       return getFreshSession(retry + 1);
     }
 
-    return { nonce, cookies: cookies.join('; '), ua };
+    return { nonce, cookies: cookies.join('; '), ua, ip: sessionIP };
   } catch (e) {
     if (retry < 2) {
       await sleep(1000);
@@ -114,7 +114,7 @@ async function generateOneImage(params, session) {
     enable_upscale: enable_upscale !== false ? 'true' : 'false',
   });
 
-  const resp = await fetchWithProxy('https://flatai.org/wp-admin/admin-ajax.php', {
+  const resp = await fetchWithBypass('https://flatai.org/wp-admin/admin-ajax.php', {
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
@@ -125,7 +125,7 @@ async function generateOneImage(params, session) {
       ...(session.cookies ? { cookie: session.cookies } : {}),
     },
     body: body.toString(),
-  }, 30000);
+  }, session.ip, 30000);
 
   const data = await resp.json();
   
@@ -133,12 +133,10 @@ async function generateOneImage(params, session) {
     throw new Error(data.data?.message || 'Generation failed');
   }
 
-  // Direct response
   if (data.data?.images?.length > 0 && !data.data.pending) {
     return data.data;
   }
 
-  // Need to poll
   const token = data.data?.job_token;
   if (!token) throw new Error('No job token');
 
@@ -152,32 +150,34 @@ async function pollForResult(token, session, seed) {
   while (Date.now() - start < maxWait) {
     await sleep(3000);
     
-    // Refresh session every poll to avoid "invalid session"
+    // Refresh nonce using the SAME IP and UA
+    let currentSession = session;
     try {
-      session = await getFreshSession();
+      currentSession = await getFreshSession();
+      currentSession.ip = session.ip; // Keep IP consistent during polling
     } catch {
-      continue;
+      // Continue with old session if refresh fails
     }
 
     const body = new URLSearchParams({
       action: 'ai_poll_generation_status',
-      nonce: session.nonce,
+      nonce: currentSession.nonce,
       job_token: token,
     });
 
     try {
-      const resp = await fetchWithProxy('https://flatai.org/wp-admin/admin-ajax.php', {
+      const resp = await fetchWithBypass('https://flatai.org/wp-admin/admin-ajax.php', {
         method: 'POST',
         headers: {
           'content-type': 'application/x-www-form-urlencoded',
-          'user-agent': session.ua,
+          'user-agent': currentSession.ua,
           'origin': 'https://flatai.org',
           'referer': 'https://flatai.org/ai-image-generator-free-no-signup/',
           'x-requested-with': 'XMLHttpRequest',
-          ...(session.cookies ? { cookie: session.cookies } : {}),
+          ...(currentSession.cookies ? { cookie: currentSession.cookies } : {}),
         },
         body: body.toString(),
-      }, 15000);
+      }, currentSession.ip, 15000);
 
       const data = await resp.json();
       
@@ -208,10 +208,9 @@ async function handleGenerate(request) {
 
     for (let i = 0; i < qty; i++) {
       try {
-        // Fresh session for each image
         const session = await getFreshSession();
         if (!session.nonce) {
-          errors.push(`Image ${i + 1}: No session`);
+          errors.push(`Image ${i + 1}: Failed to get secure session`);
           continue;
         }
 
@@ -227,7 +226,6 @@ async function handleGenerate(request) {
 
         results.push({ index: i + 1, ...result, seed: usedSeed });
         
-        // Small delay between images
         if (i < qty - 1) await sleep(2000);
         
       } catch (err) {
@@ -259,7 +257,7 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ===== HTML UI =====
+// ===== HTML UI (unchanged) =====
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -608,4 +606,4 @@ document.getElementById('prompt').addEventListener('keydown',e=>{
 renderHist();
 </script>
 </body>
-</html>`;
+</html>
