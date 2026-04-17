@@ -65,7 +65,7 @@ async function fetchWithBypass(url, options, sessionIP, timeout = 25000) {
 async function getFreshSession(retry = 0) {
   try {
     const ua = getRandomUA();
-    const sessionIP = getRandomIP(); // Bind a unique IP to this session
+    const sessionIP = getRandomIP();
     
     const resp = await fetchWithBypass('https://flatai.org/ai-image-generator-free-no-signup/', {
       headers: {
@@ -150,11 +150,10 @@ async function pollForResult(token, session, seed) {
   while (Date.now() - start < maxWait) {
     await sleep(3000);
     
-    // Refresh nonce using the SAME IP and UA
     let currentSession = session;
     try {
       currentSession = await getFreshSession();
-      currentSession.ip = session.ip; // Keep IP consistent during polling
+      currentSession.ip = session.ip;
     } catch {
       // Continue with old session if refresh fails
     }
@@ -257,7 +256,7 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ===== HTML UI (unchanged) =====
+// ===== HTML UI =====
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -595,7 +594,7 @@ function loadH(i){
 
 function toast(msg,type=''){
   const t=document.getElementById('toast');t.className='toast '+type+' show';
-  t.innerHTML='<i class=\"fas fa-'+(type==='ok'?'check-circle':type==='err'?'exclamation-circle':'info-circle')+'\"></i> '+msg;
+  t.innerHTML='<i class="fas fa-'+(type==='ok'?'check-circle':type==='err'?'exclamation-circle':'info-circle')+'"></i> '+msg;
   setTimeout(()=>t.classList.remove('show'),3500);
 }
 
@@ -606,4 +605,4 @@ document.getElementById('prompt').addEventListener('keydown',e=>{
 renderHist();
 </script>
 </body>
-</html>
+</html>`;
